@@ -1,0 +1,16 @@
+# Local datasets and generated experiment artifacts
+kFall/KFall Dataset/
+**/outputs/
+**/checkpoints/
+**/__pycache__/
+*.py[cod]
+
+# Local environments and editor files
+.venv/
+venv/
+env/
+.env
+.DS_Store
+.idea/
+.vscode/
+
