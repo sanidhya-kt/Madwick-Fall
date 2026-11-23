@@ -13,4 +13,8 @@ env/
 .DS_Store
 .idea/
 .vscode/
+.tools/
+.python/
+.venv-paper/
+.uv-cache/
 

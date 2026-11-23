@@ -4,6 +4,8 @@ import glob
 import re
 from dataclasses import dataclass
 from typing import List, Optional
+from concurrent.futures import ProcessPoolExecutor
+import copy
 
 import numpy as np
 import pandas as pd
@@ -123,7 +125,9 @@ class KFallDataset:
                 })
 
         self._label_file_count = len(files)
-        labels = pd.DataFrame(rows).drop_duplicates(["subject_id", "trial_id"], keep="first")
+        labels = pd.DataFrame(rows)
+        if labels.duplicated(["subject_id", "trial_id"]).any():
+            raise ValueError("Duplicate KFall annotations; refusing to discard ambiguity")
         return labels
 
     def _index_trials(self) -> List[TrialMeta]:
@@ -136,25 +140,49 @@ class KFallDataset:
             subject_id = os.path.basename(sdir)
             for fp in sorted(glob.glob(os.path.join(sdir, "*.csv"))):
                 trial_id = os.path.splitext(os.path.basename(fp))[0]
+                parsed = re.fullmatch(r"S(\d{2})T(\d{2})R(\d{2})", trial_id)
+                if parsed is None or int(parsed[1]) != self._subject_num(subject_id):
+                    raise ValueError(f"Invalid trial filename: {fp}")
+                task = int(parsed[2])
+                # Release task IDs: ADL 1..19,35,36; falls 20..34.
+                # Missing FALL annotations remain fatal.
+                if task not in range(1, 37):
+                    raise ValueError(f"Unknown KFall task: {trial_id}")
+                is_fall = 20 <= task <= 34
                 match = self.labels[
                     (self.labels.subject_id == subject_id) &
                     (self.labels.trial_id == trial_id)
                 ]
+                if not is_fall and len(match) == 0:
+                    trials.append(TrialMeta(subject_id, f"T{task:02d}", trial_id, False, fp))
+                    continue
                 if len(match) != 1:
                     raise ValueError(f"Missing/ambiguous label for {subject_id}/{trial_id}")
                 row = match.iloc[0]
+                if bool(row.is_fall) != is_fall:
+                    raise ValueError(f"Task/annotation mismatch: {trial_id}")
+                if is_fall and (pd.isna(row.fall_start_frame) or pd.isna(row.fall_impact_frame)
+                                or not 1 <= row.fall_start_frame < row.fall_impact_frame):
+                    raise ValueError(f"Invalid fall annotation: {trial_id}")
                 trials.append(TrialMeta(
                     subject_id=subject_id,
                     task_id=trial_id,
                     trial_id=trial_id,
                     is_fall=bool(row.is_fall),
                     filepath=fp,
-                    fall_start_idx=int(row.fall_start_frame) if bool(row.is_fall) else None,
+                    # FrameCounter starts at 1. Onset is an inclusive index;
+                    # impact frame count is an exclusive pre-impact boundary.
+                    fall_start_idx=int(row.fall_start_frame) - 1 if bool(row.is_fall) else None,
                     fall_impact_idx=int(row.fall_impact_frame) if bool(row.is_fall) else None,
                 ))
 
         if len(trials) != 5075:
             raise ValueError(f"Expected 5075 KFall trials, found {len(trials)}")
+        if sum(t.is_fall for t in trials) != 2346 or len({t.subject_id for t in trials}) != 32:
+            raise ValueError("Unexpected KFall subject/class distribution")
+        indexed_falls = {(t.subject_id, t.trial_id) for t in trials if t.is_fall}
+        if set(zip(self.labels.subject_id, self.labels.trial_id)) != indexed_falls:
+            raise ValueError("Annotation files and fall recordings do not match")
         return trials
 
     def _read_trial_signal(self, trial: TrialMeta) -> np.ndarray:
@@ -166,12 +194,30 @@ class KFallDataset:
         cols = [normalized[n] for n in names]
         return df[cols].to_numpy(dtype=np.float64)
 
-    def build_windows(self, augment_fall_train: bool = False, rng=None, window_ms=875, fall_sampling="reverse"):
+    def build_windows(self, augment_fall_train: bool = False, rng=None, window_ms=875, fall_sampling="reverse", overlap_thresh=0.5, jobs=1, label_rule="window_fraction"):
+        if jobs > 1:
+            if augment_fall_train:
+                raise ValueError("Augment only after splitting; parallel preprocessing does not augment")
+            chunks = []
+            for part in np.array_split(np.arange(len(self.trials)), jobs * 4):
+                ds = copy.copy(self)
+                ds.trials = [self.trials[i] for i in part]
+                chunks.append((ds, window_ms, fall_sampling, overlap_thresh, label_rule))
+            records = []
+            with ProcessPoolExecutor(max_workers=jobs) as pool:
+                for i, recs in enumerate(pool.map(_build_chunk, chunks)):
+                    records.extend(recs)
+                    print(f"Preprocessing chunk {i+1}/{len(chunks)}: {len(records)} windows", flush=True)
+            return records
         rng = rng or np.random.default_rng(42)
         records = []
 
         for trial in self.trials:
             raw = self._read_trial_signal(trial)
+            if not np.isfinite(raw).all():
+                raise ValueError(f"Nonfinite IMU data: {trial.trial_id}")
+            if trial.is_fall and trial.fall_impact_idx > len(raw):
+                raise ValueError(f"Impact outside recording: {trial.trial_id}")
 
             if trial.is_fall:
                 if trial.fall_impact_idx is None:
@@ -198,7 +244,8 @@ class KFallDataset:
 
             for s, e in windows:
                 label = (
-                    assign_window_label(s, e, trial.fall_start_idx or 0, trial.fall_impact_idx)
+                    assign_window_label(s, e, trial.fall_start_idx or 0, trial.fall_impact_idx,
+                                        overlap_thresh, label_rule, observable_end=len(raw))
                     if trial.is_fall else 0
                 )
                 rec = {
@@ -206,6 +253,8 @@ class KFallDataset:
                     "trial_id": trial.trial_id,
                     "is_fall": trial.is_fall,
                     "label": label,
+                    "window_start": s,
+                    "window_end": e,
                     "body_accel": acc_body[s:e],
                     "body_gyro": gyro_body[s:e],
                     "global_accel": acc_global[s:e],
@@ -224,12 +273,20 @@ class KFallDataset:
 
         return records
 
-    def process_trial_for_rolling(self, trial: TrialMeta):
+    def process_trial_for_rolling(self, trial: TrialMeta, causal=False):
         """Paper Sec. 4.4.1: process the complete trial before impact."""
         raw = self._read_trial_signal(trial)
-        filtered = butterworth_lowpass(raw, fs=self.fs)
+        if not causal:
+            raise ValueError("Rolling inference requires causal=True to exclude future samples")
+        from .preprocessing import causal_butterworth_lowpass
+        filtered = causal_butterworth_lowpass(raw, fs=self.fs)
         acc_body = filtered[:, :3]
         gyro_body = filtered[:, 3:]
         mad = MadgwickAHRS(beta=self.beta, dt=1.0 / self.fs)
         acc_global, gyro_global, _ = mad.process_sequence(acc_body, gyro_body)
         return acc_body, gyro_body, acc_global, gyro_global
+
+
+def _build_chunk(args):
+    ds, window_ms, fall_sampling, overlap_thresh, label_rule = args
+    return ds.build_windows(window_ms=window_ms, fall_sampling=fall_sampling, overlap_thresh=overlap_thresh, label_rule=label_rule)

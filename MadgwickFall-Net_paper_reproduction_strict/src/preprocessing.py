@@ -1,6 +1,6 @@
 """Preprocessing and augmentation specified by MadgwickFall-Net."""
 import numpy as np
-from scipy.signal import butter, filtfilt
+from scipy.signal import butter, filtfilt, sosfilt, sosfilt_zi
 from scipy.interpolate import CubicSpline
 
 FS = 100
@@ -24,6 +24,13 @@ def samples_from_ms(ms, fs=FS):
 def butterworth_lowpass(x, cutoff=BUTTER_CUTOFF_HZ, fs=FS, order=BUTTER_ORDER):
     b, a = butter(order, cutoff / (0.5 * fs), btype="low")
     return filtfilt(b, a, x, axis=0)
+
+
+def causal_butterworth_lowpass(x, cutoff=BUTTER_CUTOFF_HZ, fs=FS, order=BUTTER_ORDER):
+    """Streaming validation variant; phase/initial state are not specified by paper."""
+    sos = butter(order, cutoff, fs=fs, btype="low", output="sos")
+    zi = sosfilt_zi(sos)[:, :, None] * x[0][None, None, :]
+    return sosfilt(sos, x, axis=0, zi=zi)[0]
 
 
 def truncate_fall_trial(data, t_impact_idx, margin_ms=PRE_IMPACT_MARGIN_MS, fs=FS):
@@ -54,10 +61,30 @@ def forward_sliding_windows(data, window_ms=WINDOW_MS, overlap=OVERLAP, fs=FS):
 
 
 def assign_window_label(win_start, win_end, fall_start_idx, fall_impact_idx,
-                        overlap_thresh=0.5):
+                        overlap_thresh=0.5, label_rule="window_fraction", observable_end=None):
+    """The paper omits its numerical labelling rule; keep interpretations explicit.
+
+    window_fraction is the original reproduction's unverified 50% rule.
+    any_overlap is a documented alternative (overlap ratio > 0), not an
+    author-provided threshold. observable_fraction normalizes by the shorter
+    of the window and retained fall phase, with an explicit cutoff argument.
+    All rules keep pre-onset windows negative.
+    """
     inter_start = max(win_start, fall_start_idx)
-    inter_end = min(win_end, fall_impact_idx)
+    phase_end = observable_end if label_rule == "observable_fraction" else fall_impact_idx
+    if phase_end is None:
+        raise ValueError("observable_fraction requires the pre-impact cutoff")
+    inter_end = min(win_end, phase_end)
     overlap_len = max(0, inter_end - inter_start)
+    if label_rule == "any_overlap":
+        return int(overlap_len > 0)
+    if label_rule == "observable_fraction":
+        # Normalize by the shorter of the window and observable fall phase.
+        # This avoids erasing short falls while rejecting tiny boundary overlap.
+        denominator = min(win_end - win_start, phase_end - fall_start_idx)
+        return int(denominator > 0 and overlap_len / denominator >= overlap_thresh)
+    if label_rule != "window_fraction":
+        raise ValueError(f"Unknown label rule: {label_rule}")
     return int((overlap_len / (win_end - win_start)) >= overlap_thresh)
 
 
@@ -71,9 +98,10 @@ def augment_scaling(x, rng):
 
 def augment_time_warp(x, rng):
     t = np.arange(x.shape[0], dtype=float)
-    knot_x = np.linspace(0, x.shape[0] - 1, TIMEWARP_KNOTS + 2)
+    # Literal four-point interpretation, including the two fixed endpoints.
+    knot_x = np.linspace(0, x.shape[0] - 1, TIMEWARP_KNOTS)
     knot_y = knot_x + rng.normal(
-        0.0, TIMEWARP_SIGMA * x.shape[0] / (TIMEWARP_KNOTS + 1),
+        0.0, TIMEWARP_SIGMA * x.shape[0] / (TIMEWARP_KNOTS - 1),
         size=knot_x.shape,
     )
     knot_y[0], knot_y[-1] = 0.0, x.shape[0] - 1.0
@@ -86,7 +114,15 @@ def augment_time_warp(x, rng):
     return out
 
 
-def _apply_variant(streams, kind, rng):
+def _apply_variant(streams, kind, rng, synchronized=False):
+    if synchronized and kind == "scaling":
+        scale = rng.normal(SCALING_MEAN, SCALING_STD)
+        return {name: x * scale for name, x in streams.items()}
+    if synchronized and kind == "time_warp":
+        # One temporal map shared by all axes and both coordinate frames.
+        names = list(streams)
+        warped = augment_time_warp(np.concatenate([streams[k] for k in names], axis=1), rng)
+        return {name: part for name, part in zip(names, np.split(warped, len(names), axis=1))}
     out = {}
     for name, x in streams.items():
         if kind == "jitter":
@@ -100,7 +136,7 @@ def _apply_variant(streams, kind, rng):
     return out
 
 
-def augment_four_streams(record, rng=None):
+def augment_four_streams(record, rng=None, synchronized=False):
     """Create the six augmented variants needed for 7-fold total data.
 
     The paper specifies the three augmentation operations and the total
@@ -118,10 +154,10 @@ def augment_four_streams(record, rng=None):
     }
 
     # Seven total samples: original + 6 augmented variants.
-    j = _apply_variant(base, "jitter", rng)
-    s = _apply_variant(base, "scaling", rng)
-    w = _apply_variant(base, "time_warp", rng)
-    js = _apply_variant(j, "scaling", rng)
-    jw = _apply_variant(j, "time_warp", rng)
-    sw = _apply_variant(s, "time_warp", rng)
+    j = _apply_variant(base, "jitter", rng, synchronized)
+    s = _apply_variant(base, "scaling", rng, synchronized)
+    w = _apply_variant(base, "time_warp", rng, synchronized)
+    js = _apply_variant(j, "scaling", rng, synchronized)
+    jw = _apply_variant(j, "time_warp", rng, synchronized)
+    sw = _apply_variant(s, "time_warp", rng, synchronized)
     return [j, s, w, js, jw, sw]

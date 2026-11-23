@@ -17,9 +17,54 @@ training script to run once you have a local KFall copy + a GPU/CPU torch
 environment.
 """
 import random
+import time
+import os
+from pathlib import Path
 import numpy as np
 
 SEED = 42
+
+
+def save_checkpoint(path, state):
+    """Atomic epoch boundary checkpoint; retain the preceding epoch as fallback."""
+    import torch
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("wb") as f:
+        torch.save(state, f)
+        f.flush()
+        os.fsync(f.fileno())
+    if path.exists():
+        os.replace(path, path.with_name(path.stem + "_previous.pt"))
+    os.replace(tmp, path)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def checkpoint_rng_state(loader):
+    import torch
+    return {"python": random.getstate(), "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "sampler": loader.sampler.generator.get_state() if hasattr(loader.sampler, "generator") else None,
+            "workers": loader.generator.get_state() if loader.generator is not None else None}
+
+
+def restore_checkpoint_rng(state, loader):
+    import torch
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    if state["cuda"] is not None:
+        torch.cuda.set_rng_state_all(state["cuda"])
+    if state["sampler"] is not None:
+        loader.sampler.generator.set_state(state["sampler"])
+    if state["workers"] is not None:
+        loader.generator.set_state(state["workers"])
 
 
 def set_seed(seed: int = SEED):
@@ -65,7 +110,8 @@ def compute_class_weights(labels: np.ndarray) -> np.ndarray:
 def train_one_fold(model, train_loader, val_loader, device="cpu",
                     epochs=105, grad_clip_norm=0.8, class_weights=None,
                     label_smoothing=0.01, lr=1e-3, weight_decay=8e-5,
-                    use_amp=False, log_every=10):
+                    use_amp=False, log_every=1, checkpoint_path=None,
+                    resume=False, checkpoint_metadata=None):
     """
     One 5-fold-CV fold: trains `epochs` epochs, returns the trained model
     and per-epoch train loss history. Validation (held-out subjects) is
@@ -85,7 +131,32 @@ def train_one_fold(model, train_loader, val_loader, device="cpu",
 
     steps_per_epoch = len(train_loader)
     history = []
-    for epoch in range(epochs):
+    start_epoch = 0
+    if resume and checkpoint_path:
+        candidates = [Path(checkpoint_path), Path(checkpoint_path).with_name(Path(checkpoint_path).stem + "_previous.pt")]
+        existing = [p for p in candidates if p.exists()]
+        for path in existing:
+            try:
+                # Checkpoints are trusted local artifacts produced by this run.
+                saved = torch.load(path, map_location="cpu", weights_only=False)
+            except Exception:
+                if path == existing[-1]:
+                    raise
+                print(f"Unable to read {path}; trying previous checkpoint", flush=True)
+                continue
+            if saved["metadata"] != checkpoint_metadata:
+                raise ValueError("Checkpoint configuration/source/fold mismatch; refusing unsafe resume")
+            model.load_state_dict(saved["model"])
+            opt.load_state_dict(saved["optimizer"])
+            sched.load_state_dict(saved["scheduler"])
+            scaler.load_state_dict(saved["scaler"])
+            history = saved["history"]
+            start_epoch = saved["completed_epochs"]
+            restore_checkpoint_rng(saved["rng"], train_loader)
+            print(f"RESUMED {path}: {start_epoch}/{epochs} epochs complete; next epoch {start_epoch+1}", flush=True)
+            break
+    for epoch in range(start_epoch, epochs):
+        epoch_started = time.monotonic()
         model.train()
         epoch_loss = 0.0
         n = 0
@@ -106,9 +177,18 @@ def train_one_fold(model, train_loader, val_loader, device="cpu",
             n += labels.size(0)
         avg_loss = epoch_loss / max(n, 1)
         history.append(avg_loss)
+        if checkpoint_path:
+            save_checkpoint(checkpoint_path, {
+                "format_version": 1, "completed_epochs": epoch + 1,
+                "model": model.state_dict(), "optimizer": opt.state_dict(),
+                "scheduler": sched.state_dict(), "scaler": scaler.state_dict(),
+                "history": history, "rng": checkpoint_rng_state(train_loader),
+                "metadata": checkpoint_metadata,
+            })
+            print(f"CHECKPOINT saved epoch {epoch+1}: {checkpoint_path}", flush=True)
         if (epoch + 1) % log_every == 0 or epoch == 0:
             print(f"    epoch {epoch+1:3d}/{epochs}  train_loss={avg_loss:.4f}  "
-                  f"lr={opt.param_groups[0]['lr']:.2e}")
+                  f"lr={opt.param_groups[0]['lr']:.2e} elapsed_s={time.monotonic()-epoch_started:.1f}", flush=True)
 
     return model, history
 
